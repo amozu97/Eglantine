@@ -65,12 +65,7 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         const Id matrix_b = ctx.OpFunctionParameter(ctx.U32[2]);
         const Id matrix_c = ctx.OpFunctionParameter(ctx.U32[2]);
         ctx.AddLabel();
-        const Id counter = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, u32ty),
-                                                spv::StorageClass::Function);
         std::array<Id, 4> accumulators;
-        for (auto& acc : accumulators)
-            acc = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, f32ty),
-                                       spv::StorageClass::Function);
         std::array<Id, 8> inputs;
         for (u32 i = 0; i < 4; ++i)
             inputs[i] = ctx.OpCompositeExtract(u32ty, matrix_a, i);
@@ -81,69 +76,48 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         for (u32 row = 0; row < 2; ++row) {
             const Id c = unpack(inputs[6 + row]);
             for (u32 col = 0; col < 2; ++col)
-                ctx.OpStore(accumulators[row * 2 + col], ctx.OpCompositeExtract(f32ty, c, col));
+                accumulators[row * 2 + col] = ctx.OpCompositeExtract(f32ty, c, col);
         }
-        ctx.OpStore(counter, imm(0));
         const Id lane = ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id);
         const Id warp_base = and_(lane, ~31U);
         const Id row_base = and_(lane, 28);
         const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
-        const Id header = ctx.OpLabel(), body = ctx.OpLabel(), next = ctx.OpLabel(),
-                 end = ctx.OpLabel();
-        ctx.OpBranch(header);
-        ctx.AddLabel(header);
-        const Id pair = ctx.OpLoad(u32ty, counter);
-        const Id more = ctx.OpULessThan(ctx.U1, pair, imm(variant ? 8 : 4));
-        ctx.OpLoopMerge(end, next, spv::LoopControlMask::DontUnroll);
-        ctx.OpBranchConditional(more, body, end);
-        ctx.AddLabel(body);
-        const Id upper = ctx.OpUGreaterThanEqual(ctx.U1, pair, imm(4));
-        const Id component = and_(pair, 3);
-        const Id a_lane = add(warp_base, add(row_base, component));
-        const Id b_lane = add(warp_base, add(col_base, component));
-        const Id b = ctx.OpSelect(u32ty, upper, inputs[5], inputs[4]);
-        std::array<Id, 2> bs;
-        for (u32 col = 0; col < 2; ++col)
-            bs[col] =
-                unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), b, add(b_lane, imm(col * 4))));
-        const Id round_now = ctx.OpIEqual(ctx.U1, component, imm(3));
-        for (u32 row = 0; row < 2; ++row) {
-            const Id a = ctx.OpSelect(u32ty, upper, inputs[row + 2], inputs[row]);
-            const Id as = unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), a, a_lane));
+        const u32 pairs = variant ? 8 : 4;
+        for (u32 pair = 0; pair < pairs; ++pair) {
+            const u32 component = pair & 3;
+            const Id a_lane = add(warp_base, add(row_base, imm(component)));
+            const Id b_lane = add(warp_base, add(col_base, imm(component)));
+            const Id b = inputs[4 + pair / 4];
+            std::array<Id, 2> bs;
             for (u32 col = 0; col < 2; ++col) {
-                Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
-                for (u32 half = 0; half < 2; ++half) {
-                    value = ctx.OpFma(f32ty, ctx.OpCompositeExtract(f32ty, as, half),
-                                      ctx.OpCompositeExtract(f32ty, bs[col], half), value);
-                    ctx.Decorate(value, spv::Decoration::NoContraction);
+                bs[col] = unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), b,
+                                                              add(b_lane, imm(col * 4))));
+            }
+            for (u32 row = 0; row < 2; ++row) {
+                const Id a = inputs[row + (pair / 4) * 2];
+                const Id as = unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), a, a_lane));
+                for (u32 col = 0; col < 2; ++col) {
+                    Id value = accumulators[row * 2 + col];
+                    for (u32 half = 0; half < 2; ++half) {
+                        value = ctx.OpFma(f32ty, ctx.OpCompositeExtract(f32ty, as, half),
+                                          ctx.OpCompositeExtract(f32ty, bs[col], half), value);
+                        ctx.Decorate(value, spv::Decoration::NoContraction);
+                    }
+                    accumulators[row * 2 + col] = value;
                 }
-                ctx.OpStore(accumulators[row * 2 + col], value);
+            }
+            // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
+            if (component == 3) {
+                for (Id& accumulator : accumulators) {
+                    accumulator = round_half(accumulator);
+                }
             }
         }
-        // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
-        // OpSelect evaluates both operands: keep the expensive half conversion in
-        // a branch so the other three pairs do no rounding work. The counter is
-        // identical in every participating lane and all shuffles precede this branch.
-        const Id round_block = ctx.OpLabel(), round_merge = ctx.OpLabel();
-        ctx.OpSelectionMerge(round_merge, spv::SelectionControlMask::DontFlatten);
-        ctx.OpBranchConditional(round_now, round_block, round_merge);
-        ctx.AddLabel(round_block);
-        for (const Id accumulator : accumulators) {
-            ctx.OpStore(accumulator, round_half(ctx.OpLoad(f32ty, accumulator)));
-        }
-        ctx.OpBranch(round_merge);
-        ctx.AddLabel(round_merge);
-        ctx.OpBranch(next);
-        ctx.AddLabel(next);
-        ctx.OpStore(counter, add(pair, imm(1)));
-        ctx.OpBranch(header);
-        ctx.AddLabel(end);
         std::array<Id, 2> packed;
         for (u32 row = 0; row < 2; ++row)
             packed[row] = ctx.OpPackHalf2x16(
-                u32ty,
-                ctx.OpCompositeConstruct(ctx.F32[2], ctx.OpLoad(f32ty, accumulators[row * 2]),
-                                         ctx.OpLoad(f32ty, accumulators[row * 2 + 1])));
+                u32ty, ctx.OpCompositeConstruct(ctx.F32[2], accumulators[row * 2],
+                                                accumulators[row * 2 + 1]));
         ctx.OpReturnValue(ctx.OpCompositeConstruct(ctx.U32[2], packed[0], packed[1]));
         ctx.OpFunctionEnd();
     }
